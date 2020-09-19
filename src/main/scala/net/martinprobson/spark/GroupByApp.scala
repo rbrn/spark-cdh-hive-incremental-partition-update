@@ -13,10 +13,13 @@ import org.apache.spark.sql.hive.HiveContext
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.{SparkConf, SparkContext}
 
-import scala.collection.JavaConversions.asScalaIterator
+import scala.collection.JavaConversions.{asJavaCollection, asScalaIterator}
+import scala.collection.JavaConverters.{asScalaBufferConverter, mutableSeqAsJavaListConverter}
 import scala.collection.mutable
+import scala.collection.mutable.ListBuffer
 
 
+case class DailyStatus( functionId: String, day: String, status: String, nextGreen: Timestamp)
 object GroupByApp {
   def main(args: Array[String]) {
     Logger.getLogger("org").setLevel(Level.OFF)
@@ -24,7 +27,7 @@ object GroupByApp {
     conf.setMaster("local[*]")
 
     val spark =  new SparkContext(conf)
-
+    import spark._
     val hiveContext: HiveContext = new org.apache.spark.sql.hive.HiveContext(spark);
     import org.apache.spark.sql.functions._
     hiveContext.setConf("hive.exec.dynamic.partition", "true")
@@ -62,30 +65,30 @@ object GroupByApp {
     hiveContext.sql("insert overwrite table producer_messages partition (execution_day) select * from temp_view")
 
    // hiveContext.sql("select * from producer_messages").show()
-    case class DailyStatus( functionId: String, day: String, status: String, nextGreen: String )
     val res = hiveContext.sql("select function_id, execution_day, count(*) cnt, collect_list(struct(execution_time, test_result)) executions  " +
       "from producer_messages group by function_id, execution_day order by function_id, execution_day asc")
 
       res.rdd.groupBy(f=> f.getString(0)).foldByKey(new mutable.MutableList[Row])((accumList, byDayFunctionAggregate) => {
-        print(accumList)
+        val res = byDayFunctionAggregate. foldLeft( new ListBuffer[Tuple4[String, String, String, Timestamp]]) ((accum, element) => {
+          val (func, day) = (element.getString(0), element.getString(1))
+          val status : mutable.Buffer[GenericRowWithSchema] = element.getList(3).asScala;
 
-        val res = byDayFunctionAggregate.foldLeft( new mutable.MutableList[DailyStatus]) ((accum, element) => {
-          println(accum)
+          val mapped = status.view .map(p=> Tuple2.apply(p.getString(1), p.getTimestamp(0)));
+          val failed = mapped find( p=> p._1.equals("FAIL")) headOption
+          val pass =  if (failed.isDefined) mapped find( p=> p._1.equals("PASS") && p._2.after(failed.get._2)) headOption else None
+          val statusDaily = if (failed.isDefined)  "FAIL" else "PASS"
+          val nextGreen = if(pass.isDefined) pass.get._2 else null;
 
-          val func = element.getString(0)
-          val day = element.getString(1)
-          /*
-          Iterate in list and find if it's failed.
-          It it's failed, look for a green this day.
-          If no green is today, look for one next day
-           */
-          val status = element.getList(3).stream()
-
-          val accn= accum  += DailyStatus(functionId = func, day = day, status = "???", nextGreen = day)
-          accn
+          accum  += Tuple4( func, day, statusDaily, nextGreen )
         })
-        accumList
-      }).foreach(println)
+
+      val results =   res.map( f=> {Row.fromTuple(f)}).toList
+       val list = accumList.toList ::: results
+        list
+      }).foreach(f=>{
+        println(f.toString())
+      })
+
 
 
     /* val res = hiveContext.sql("select function_id, execution_day, count(*) cnt, collect_list(struct(execution_time, test_result)) executions  " +
